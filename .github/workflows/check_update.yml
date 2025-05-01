@@ -1,0 +1,32 @@
+name: Check Upstream Update
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 时间 2 点执行一次，可根据需要调整
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your repo
+        uses: actions/checkout@v3
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/yyysuo/mosdns?tab=readme-ov-file
+          git fetch upstream
+          git log HEAD..upstream/main --oneline > diff.log
+
+      - name: Check for updates
+        run: |
+          if [ -s diff.log ]; then
+            echo "has_update=true" >> $GITHUB_ENV
+          fi
+
+      - name: Send Telegram message if updated
+        if: env.has_update == 'true'
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          -d text="🆕 仓库有更新：$(cat diff.log)"
