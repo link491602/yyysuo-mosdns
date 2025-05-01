@@ -1,0 +1,36 @@
+name: Check Upstream Update
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout your repo
+        uses: actions/checkout@v3
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/yyysuo/mosdns?tab=readme-ov-file
+          git fetch upstream
+          git log HEAD..upstream/main --oneline > diff.log
+
+      - name: Check for updates
+        run: |
+          if [ -s diff.log ]; then
+            echo "has_update=true" >> $GITHUB_ENV
+          fi
+
+      - name: Notify via Cloudflare Worker
+        if: env.has_update == 'true'
+        run: |
+          curl -X POST ${{ secrets.WORKER_URL }} \
+            -H "Content-Type: application/json" \
+            -d '{"text": "📦 仓库『${{ github.repository }}』有更新！\n📝 提交记录：\n'"$(cat diff.log | head -n 5)"'"}'
+
+      - name: Clean up
+        run: rm -f diff.log
