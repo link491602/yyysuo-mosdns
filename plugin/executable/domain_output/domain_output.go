@@ -1,35 +1,22 @@
-/*
- * Copyright (C) 2024
- *
- * This file is part of mosdns.
- *
- * mosdns is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * mosdns is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
 package domain_output
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
@@ -45,56 +32,74 @@ func init() {
 type Args struct {
 	FileStat       string `yaml:"file_stat"`
 	FileRule       string `yaml:"file_rule"`
-	GenRule        string `yaml:"gen_rule"`        // 生成规则文件的路径
-	Pattern        string `yaml:"pattern"`         // 规则模板，模板中的 "DOMAIN" 替换为域名
-	AppendedString string `yaml:"appended_string"` // 如果配置了此项，则在生成的文件第一行添加此字符串
+	GenRule        string `yaml:"gen_rule"`
+	Pattern        string `yaml:"pattern"`
+	AppendedString string `yaml:"appended_string"`
 	MaxEntries     int    `yaml:"max_entries"`
 	DumpInterval   int    `yaml:"dump_interval"`
+	DomainSetURL   string `yaml:"domain_set_url"`
 }
 
 type domainOutput struct {
 	fileStat       string
 	fileRule       string
-	genRule        string // 生成规则文件路径
-	pattern        string // 规则模板
-	appendedString string // 附加字符串，写入生成规则文件的第一行
+	genRule        string
+	pattern        string
+	appendedString string
 	maxEntries     int
 	dumpInterval   time.Duration
-	stats          map[string]int
-	mu             sync.Mutex
-	totalCount     int
-	entryCounter   int // 用于判断写入的计数器
-	stopChan       chan struct{}
+
+	stats        map[string]int
+	mu           sync.Mutex
+	totalCount   int
+	entryCounter int
+
+	writeSignalChan chan struct{}
+	stopChan        chan struct{}
+	workerDoneChan  chan struct{}
+
+	domainSetURL string
 }
 
-func Init(_ *coremain.BP, args any) (any, error) {
+type WriteMode int
+
+const (
+	WriteModePeriodic WriteMode = iota
+	WriteModeFlush
+	WriteModeSave
+)
+
+func Init(bp *coremain.BP, args any) (any, error) {
 	cfg := args.(*Args)
 	if cfg.DumpInterval <= 0 {
-		cfg.DumpInterval = 60 // 默认值为60秒
+		cfg.DumpInterval = 60
 	}
 	d := &domainOutput{
-		fileStat:       cfg.FileStat,
-		fileRule:       cfg.FileRule,
-		genRule:        cfg.GenRule,
-		pattern:        cfg.Pattern,
-		appendedString: cfg.AppendedString,
-		maxEntries:     cfg.MaxEntries,
-		dumpInterval:   time.Duration(cfg.DumpInterval) * time.Second,
-		stats:          make(map[string]int),
-		stopChan:       make(chan struct{}),
+		fileStat:        cfg.FileStat,
+		fileRule:        cfg.FileRule,
+		genRule:         cfg.GenRule,
+		pattern:         cfg.Pattern,
+		appendedString:  cfg.AppendedString,
+		maxEntries:      cfg.MaxEntries,
+		dumpInterval:    time.Duration(cfg.DumpInterval) * time.Second,
+		stats:           make(map[string]int),
+		writeSignalChan: make(chan struct{}, 1),
+		stopChan:        make(chan struct{}),
+		workerDoneChan:  make(chan struct{}),
+		domainSetURL:    cfg.DomainSetURL,
 	}
 	d.loadFromFile()
 
-	// 启动定时写入协程
-	go d.startDumpTicker()
+	go d.startWorker()
+	bp.RegAPI(d.Api())
 
 	return d, nil
 }
 
 func QuickSetup(_ sequence.BQ, s string) (any, error) {
 	params := strings.Split(s, ",")
-	if len(params) != 6 {
-		return nil, errors.New("invalid quick setup arguments")
+	if len(params) < 6 || len(params) > 7 {
+		return nil, errors.New("invalid quick setup arguments: need 6 or 7 fields")
 	}
 	fileStat := params[0]
 	fileRule := params[1]
@@ -108,166 +113,304 @@ func QuickSetup(_ sequence.BQ, s string) (any, error) {
 	if err != nil || dumpInterval <= 0 {
 		dumpInterval = 60
 	}
-	// QuickSetup 中未支持 appended_string，可按需要扩展（比如第7个参数）
 	d := &domainOutput{
-		fileStat:       fileStat,
-		fileRule:       fileRule,
-		genRule:        genRule,
-		pattern:        pattern,
-		maxEntries:     maxEntries,
-		dumpInterval:   time.Duration(dumpInterval) * time.Second,
-		stats:          make(map[string]int),
-		stopChan:       make(chan struct{}),
+		fileStat:        fileStat,
+		fileRule:        fileRule,
+		genRule:         genRule,
+		pattern:         pattern,
+		maxEntries:      maxEntries,
+		dumpInterval:    time.Duration(dumpInterval) * time.Second,
+		stats:           make(map[string]int),
+		writeSignalChan: make(chan struct{}, 1),
+		stopChan:        make(chan struct{}),
+		workerDoneChan:  make(chan struct{}),
+	}
+	if len(params) == 7 {
+		d.domainSetURL = params[6]
 	}
 	d.loadFromFile()
 
-	// 启动定时写入协程
-	go d.startDumpTicker()
+	go d.startWorker()
 
 	return d, nil
 }
 
 func (d *domainOutput) Exec(ctx context.Context, qCtx *query_context.Context) error {
+	d.mu.Lock()
 	for _, question := range qCtx.Q().Question {
-		domain := strings.TrimSuffix(question.Name, ".") // 去掉末尾的点
-		d.mu.Lock()
+		domain := strings.TrimSuffix(question.Name, ".")
 		d.stats[domain]++
 		d.totalCount++
 		d.entryCounter++
-		d.mu.Unlock()
 	}
-
-	// 达到 maxEntries 时立即写入并清空 entryCounter（但统计数据不清空）
 	if d.entryCounter >= d.maxEntries {
-		d.checkAndWrite()
+		select {
+		case d.writeSignalChan <- struct{}{}:
+		default:
+		}
 	}
+	d.mu.Unlock()
 
 	return nil
 }
 
-func (d *domainOutput) checkAndWrite() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.writeAll()
-	d.entryCounter = 0 // 清空写入计数器
-}
-
-func (d *domainOutput) loadFromFile() {
-	file, err := os.Open(d.fileStat)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	var domain string
-	var count int
-	for {
-		_, err := fmt.Fscanf(file, "%d %s\n", &count, &domain)
-		if err != nil {
-			break
-		}
-		d.mu.Lock()
-		d.stats[domain] = count
-		d.mu.Unlock()
-	}
-}
-
-func (d *domainOutput) writeToFile() {
-	entries := d.getSortedEntries()
-
-	file, err := os.Create(d.fileStat)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	for _, entry := range entries {
-		file.WriteString(fmt.Sprintf("%010d %s\n", entry[0], entry[1]))
-	}
-}
-
-func (d *domainOutput) writeRuleFile() {
-	entries := d.getSortedEntries()
-
-	file, err := os.Create(d.fileRule)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	for _, entry := range entries {
-		file.WriteString(fmt.Sprintf("full:%s\n", entry[1]))
-	}
-}
-
-// 新增：生成规则文件，将 pattern 中的 "DOMAIN" 替换为每个域名。
-// 如果配置了 appendedString，则在文件第一行写入该字符串。
-func (d *domainOutput) writeGenRuleFile() {
-	if d.genRule == "" || d.pattern == "" {
-		return
-	}
-
-	entries := make([]string, 0, len(d.stats))
-	// 遍历所有域名
-	for domain := range d.stats {
-		line := strings.ReplaceAll(d.pattern, "DOMAIN", domain)
-		entries = append(entries, line)
-	}
-	// 按字母顺序排序
-	sort.Strings(entries)
-
-	file, err := os.Create(d.genRule)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	// 如果配置了 appendedString，则写入到第一行
-	if d.appendedString != "" {
-		file.WriteString(d.appendedString + "\n")
-	}
-
-	for _, line := range entries {
-		file.WriteString(line + "\n")
-	}
-}
-
-// getSortedEntries 返回一个按统计值降序排序的切片，每个元素为 [count, domain]
-func (d *domainOutput) getSortedEntries() [][2]interface{} {
-	entries := make([][2]interface{}, 0, len(d.stats))
-	for domain, count := range d.stats {
-		entries = append(entries, [2]interface{}{count, domain})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i][0].(int) > entries[j][0].(int)
-	})
-	return entries
-}
-
-// writeAll 同时写入统计、规则和生成规则文件
-func (d *domainOutput) writeAll() {
-	d.writeToFile()
-	d.writeRuleFile()
-	d.writeGenRuleFile()
-}
-
-func (d *domainOutput) startDumpTicker() {
+func (d *domainOutput) startWorker() {
 	ticker := time.NewTicker(d.dumpInterval)
 	defer ticker.Stop()
+	defer close(d.workerDoneChan)
+
 	for {
 		select {
 		case <-ticker.C:
-			d.checkAndWrite()
+			d.performWrite(WriteModePeriodic)
+		case <-d.writeSignalChan:
+			d.performWrite(WriteModePeriodic)
 		case <-d.stopChan:
+			fmt.Println("[domain_output] worker received stop signal, stopping.")
 			return
 		}
 	}
 }
 
-func (d *domainOutput) Shutdown() {
-	close(d.stopChan)
+func (d *domainOutput) performWrite(mode WriteMode) {
+	d.mu.Lock()
+
+	var statsToDump map[string]int
+
+	switch mode {
+	case WriteModePeriodic:
+		statsToDump = make(map[string]int, len(d.stats))
+		for k, v := range d.stats {
+			statsToDump[k] = v
+		}
+		if len(statsToDump) == 0 {
+			d.mu.Unlock()
+			return
+		}
+		d.entryCounter = 0
+	case WriteModeFlush:
+		statsToDump = make(map[string]int)
+		d.stats = make(map[string]int)
+		d.totalCount = 0
+		d.entryCounter = 0
+	case WriteModeSave:
+		statsToDump = make(map[string]int, len(d.stats))
+		for k, v := range d.stats {
+			statsToDump[k] = v
+		}
+		d.entryCounter = 0
+	}
+
+	d.mu.Unlock()
+
+	d.doWriteFiles(statsToDump)
+
+	if len(statsToDump) > 0 || mode == WriteModeFlush || mode == WriteModeSave {
+		d.pushToDomainSet(statsToDump)
+	}
+}
+
+func (d *domainOutput) doWriteFiles(statsData map[string]int) {
+	writeFile := func(filePath string, writeContent func(io.Writer) error) {
+		if filePath == "" {
+			return
+		}
+		file, err := os.Create(filePath)
+		if err != nil {
+			fmt.Printf("[domain_output] failed to create file %s: %v\n", filePath, err)
+			return
+		}
+		defer file.Close()
+
+		if err := writeContent(file); err != nil {
+			fmt.Printf("[domain_output] failed to write to file %s: %v\n", filePath, err)
+		}
+	}
+
+	// 写入 stat 文件
+	writeFile(d.fileStat, func(w io.Writer) error {
+		for domain, count := range statsData {
+			// [FIXED] Removed extra "+ \n" to prevent double newlines.
+			if _, err := w.Write([]byte(fmt.Sprintf("%010d %s\n", count, domain))); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// 写入 rule 文件
+	writeFile(d.fileRule, func(w io.Writer) error {
+		for domain := range statsData {
+			// [FIXED] Removed extra "+ \n" to prevent double newlines.
+			if _, err := w.Write([]byte(fmt.Sprintf("full:%s\n", domain))); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// 写入 genRule 文件
+	writeFile(d.genRule, func(w io.Writer) error {
+		if d.pattern == "" {
+			return nil
+		}
+		if d.appendedString != "" {
+			if _, err := w.Write([]byte(d.appendedString + "\n")); err != nil {
+				return err
+			}
+		}
+		for domain := range statsData {
+			line := strings.ReplaceAll(d.pattern, "DOMAIN", domain)
+			if _, err := w.Write([]byte(line + "\n")); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (d *domainOutput) loadFromFile() {
+	file, err := os.Open(d.fileStat)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Printf("[domain_output] failed to open stat file %s: %v\n", d.fileStat, err)
+		}
+		return
+	}
+	defer file.Close()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.writeAll() // 关闭时无条件写入所有数据
+
+	var domain string
+	var count int
+	for {
+		// fmt.Fscanf can handle extra newlines gracefully.
+		_, err := fmt.Fscanf(file, "%d %s\n", &count, &domain)
+		if err != nil {
+			break
+		}
+		d.stats[domain] = count
+		d.totalCount += count
+	}
+	fmt.Printf("[domain_output] loaded %d entries from %s\n", len(d.stats), d.fileStat)
+}
+
+func (d *domainOutput) pushToDomainSet(statsData map[string]int) {
+	if d.domainSetURL == "" {
+		return
+	}
+
+	vals := make([]string, 0, len(statsData))
+	for domain := range statsData {
+		vals = append(vals, fmt.Sprintf("full:%s", domain))
+	}
+
+	payload := struct{ Values []string `json:"values"` }{Values: vals}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("[domain_output] marshal payload error: %v\n", err)
+		return
+	}
+
+	go func() {
+		req, err := http.NewRequest("POST", d.domainSetURL, bytes.NewReader(body))
+		if err != nil {
+			fmt.Printf("[domain_output] create POST request error: %v\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Printf("[domain_output] POST to domain_set error: %v\n", err)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		fmt.Printf("[domain_output] pushed %d rules to domain_set, status=%s\n", len(vals), resp.Status)
+	}()
+}
+
+func (d *domainOutput) Shutdown() error {
+	fmt.Println("[domain_output] initiating shutdown...")
+	close(d.stopChan)
+	<-d.workerDoneChan
+
+	d.performWrite(WriteModeSave)
+
+	fmt.Println("[domain_output] shutdown complete.")
+	return nil
+}
+
+func restartSelf() {
+	time.Sleep(100 * time.Millisecond)
+
+	bin, err := os.Executable()
+	if err != nil {
+		os.Exit(0)
+	}
+	args := os.Args
+	env := os.Environ()
+	syscall.Exec(bin, args, env)
+}
+
+func (d *domainOutput) Api() *chi.Mux {
+	r := chi.NewRouter()
+
+	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
+		d.performWrite(WriteModeFlush)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("domain_output flushed and files rewritten."))
+	})
+
+	r.Get("/save", func(w http.ResponseWriter, req *http.Request) {
+		d.performWrite(WriteModeSave)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("domain_output files saved."))
+	})
+
+	// GET /plugins/{tag}/show
+	// Directly reads from memory, sorts, and returns real-time statistics as plain text.
+	r.Get("/show", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text-plain; charset=utf-8")
+
+		// 1. Safely copy statistics from memory.
+		d.mu.Lock()
+		statsCopy := make(map[string]int, len(d.stats))
+		for domain, count := range d.stats {
+			statsCopy[domain] = count
+		}
+		d.mu.Unlock()
+
+		// 2. For better readability, sort the results (descending by count).
+		type domainStat struct {
+			Domain string
+			Count  int
+		}
+		statsSlice := make([]domainStat, 0, len(statsCopy))
+		for domain, count := range statsCopy {
+			statsSlice = append(statsSlice, domainStat{Domain: domain, Count: count})
+		}
+		sort.Slice(statsSlice, func(i, j int) bool {
+			return statsSlice[i].Count > statsSlice[j].Count
+		})
+
+		// 3. Format and write the sorted data to the HTTP response.
+		for _, stat := range statsSlice {
+			// %010d format is consistent with the original file_stat format.
+			if _, err := fmt.Fprintf(w, "%010d %s\n", stat.Count, stat.Domain); err != nil {
+				fmt.Printf("[domain_output] failed to write to http response: %v\n", err)
+				return
+			}
+		}
+	})
+
+	r.Get("/restartall", func(w http.ResponseWriter, req *http.Request) {
+		d.performWrite(WriteModeSave)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("mosdns restarted"))
+		go restartSelf()
+	})
+
+	return r
 }

@@ -24,15 +24,19 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
+	"github.com/go-chi/chi/v5"
 	"github.com/sagernet/sing/common/varbin"
 	"go4.org/netipx"
 )
@@ -41,10 +45,6 @@ const PluginType = "ip_set"
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
-}
-
-func Init(bp *coremain.BP, args any) (any, error) {
-	return NewIPSet(bp, args.(*Args))
 }
 
 // Args holds the configuration for ip_set plugin
@@ -56,28 +56,42 @@ type Args struct {
 
 var _ data_provider.IPMatcherProvider = (*IPSet)(nil)
 
-// IPSet implements IPMatcherProvider
+// IPSet implements IPMatcherProvider and holds state
 type IPSet struct {
-	mg []netlist.Matcher
+	mg    []netlist.Matcher
+	list  *netlist.List
+	files []string
+	mutex sync.RWMutex
 }
 
 // GetIPMatcher returns the combined matcher
 func (d *IPSet) GetIPMatcher() netlist.Matcher {
+	d.mutex.RLock()
+	defer d.mutex.RUnlock()
 	return MatcherGroup(d.mg)
+}
+
+// Init plugin, build IPSet and register HTTP API
+func Init(bp *coremain.BP, args any) (any, error) {
+	p, err := NewIPSet(bp, args.(*Args))
+	if err != nil {
+		return nil, err
+	}
+	bp.RegAPI(p.api())
+	return p, nil
 }
 
 // NewIPSet creates a new IPSet, loading plain IPs, files (text or .srs), then referenced sets.
 func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
-	p := &IPSet{}
+	p := &IPSet{files: args.Files, list: netlist.NewList()}
 
 	// load IPs and files
-	l := netlist.NewList()
-	if err := LoadFromIPsAndFiles(args.IPs, args.Files, l); err != nil {
+	if err := LoadFromIPsAndFiles(args.IPs, args.Files, p.list); err != nil {
 		return nil, err
 	}
-	l.Sort()
-	if l.Len() > 0 {
-		p.mg = append(p.mg, l)
+	p.list.Sort()
+	if p.list.Len() > 0 {
+		p.mg = append(p.mg, p.list)
 	}
 
 	// load other sets by tag
@@ -92,6 +106,112 @@ func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 	return p, nil
 }
 
+// api registers HTTP routes: show, save, flush, post
+func (d *IPSet) api() *chi.Mux {
+	r := chi.NewRouter()
+
+	// GET /show: list in-memory prefixes
+	r.Get("/show", func(w http.ResponseWriter, r *http.Request) {
+		d.mutex.RLock()
+		defer d.mutex.RUnlock()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		d.list.ForEach(func(pfx netip.Prefix) {
+			io.WriteString(w, normalizePrefix(pfx).String()+"\n")
+		})
+	})
+
+	// GET /save: persist to files
+	r.Get("/save", func(w http.ResponseWriter, r *http.Request) {
+		d.mutex.RLock()
+		defer d.mutex.RUnlock()
+		if err := d.saveToFiles(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte("ip_set rules saved"))
+	})
+
+	// GET /flush: clear in-memory and save empty list
+	r.Get("/flush", func(w http.ResponseWriter, r *http.Request) {
+		d.mutex.Lock()
+		defer d.mutex.Unlock() // Use defer for safety
+
+		d.list = netlist.NewList()
+		// MODIFIED: Simplified the update of the matcher group.
+		d.mg = []netlist.Matcher{d.list}
+
+		// MODIFIED: Moved saveToFiles inside the lock to ensure atomicity.
+		if err := d.saveToFiles(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte("ip_set flushed and saved"))
+	})
+
+	// POST /post: replace in-memory list with provided values and save
+	r.Post("/post", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Values []string `json:"values"` }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		tmpList := netlist.NewList()
+		for _, s := range body.Values {
+			if pfx, err := parseNetipPrefix(s); err == nil {
+				tmpList.Append(pfx)
+			}
+		}
+		tmpList.Sort()
+
+		d.mutex.Lock()
+		defer d.mutex.Unlock() // Use defer for safety
+
+		d.list = tmpList
+		d.mg = []netlist.Matcher{d.list}
+
+		// BUG FIX: Moved saveToFiles inside the lock to fix a race condition.
+		// This ensures that the newly posted data is what gets saved, atomically.
+		if err := d.saveToFiles(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Write([]byte(fmt.Sprintf("ip_set replaced with %d entries", d.list.Len())))
+	})
+
+	return r
+}
+
+// saveToFiles writes the current list to each configured file
+func (d *IPSet) saveToFiles() error {
+	for _, path := range d.files {
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		w := bufio.NewWriter(f)
+		var writeErr error
+		d.list.ForEach(func(pfx netip.Prefix) {
+			if writeErr == nil {
+				_, writeErr = w.WriteString(normalizePrefix(pfx).String() + "\n")
+			}
+		})
+		if writeErr != nil {
+			f.Close() // Attempt to close even on error
+			return writeErr
+		}
+		if err := w.Flush(); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // LoadFromIPsAndFiles loads plain IPs and files (including .srs) into the list.
 func LoadFromIPsAndFiles(ips, files []string, l *netlist.List) error {
 	if err := loadFromIPs(ips, l); err != nil {
@@ -101,7 +221,6 @@ func LoadFromIPsAndFiles(ips, files []string, l *netlist.List) error {
 }
 
 func parseNetipPrefix(s string) (netip.Prefix, error) {
-	// parse CIDR or single IP
 	if strings.ContainsRune(s, '/') {
 		return netip.ParsePrefix(s)
 	}
@@ -109,18 +228,8 @@ func parseNetipPrefix(s string) (netip.Prefix, error) {
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	pfx, err := addr.Prefix(addr.BitLen())
-	if err != nil {
-		return netip.Prefix{}, err
-	}
-	return pfx, nil
-}
-
-func loadFromIPsAndFiles(ips, files []string, l *netlist.List) error {
-	if err := loadFromIPs(ips, l); err != nil {
-		return err
-	}
-	return loadFromFiles(files, l)
+	// MODIFIED: Simplified to use PrefixFrom which is more direct and doesn't return an error.
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
 func loadFromIPs(ips []string, l *netlist.List) error {
@@ -149,26 +258,21 @@ func loadFromFile(path string, l *netlist.List) error {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// MODIFIED: Improve robustness by not treating a non-existent file as a fatal error.
+		if os.IsNotExist(err) {
+			fmt.Printf("[ip_set] file not found, skipping: %s\n", path)
+			return nil
+		}
 		return err
 	}
 
-	// capture last txt line
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	var lastTxt string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			lastTxt = line
-		}
-	}
+	// PERFORMANCE: The pre-scan for `lastTxt` is removed to avoid reading large files twice.
 
-	// try .srs binary format first
+	// try .srs binary format
 	if ok, cnt, lastSrs := tryLoadSRS(data, l); ok {
 		fmt.Printf("[ip_set] loaded %d rules from srs file: %s\n", cnt, path)
 		if lastSrs != "" {
 			fmt.Printf("[ip_set] last srs rule: %s\n", lastSrs)
-		} else {
-			fmt.Printf("[ip_set] last srs rule: <none>\n")
 		}
 		return nil
 	}
@@ -180,11 +284,6 @@ func loadFromFile(path string, l *netlist.List) error {
 	}
 	after := l.Len()
 	fmt.Printf("[ip_set] loaded %d rules from text file: %s\n", after-before, path)
-	if lastTxt != "" {
-		fmt.Printf("[ip_set] last txt rule: %s\n", lastTxt)
-	} else {
-		fmt.Printf("[ip_set] last txt rule: <none>\n")
-	}
 	return nil
 }
 
@@ -201,15 +300,14 @@ func (mg MatcherGroup) Match(addr netip.Addr) bool {
 	return false
 }
 
-// --- SRS binary parsing ---
+// --- SRS parsing helpers ---
 var (
 	srsMagic            = [3]byte{'S', 'R', 'S'}
-	ruleItemIPCIDR      = uint8(6) // index for IPCIDR in SRS format
+	ruleItemIPCIDR      = uint8(6)
 	ruleItemFinal       = uint8(0xFF)
 	maxSupportedVersion = uint8(3)
 )
 
-// tryLoadSRS attempts to parse data as an SRS file and load IPCIDR entries.
 func tryLoadSRS(data []byte, l *netlist.List) (bool, int, string) {
 	r := bytes.NewReader(data)
 	var mb [3]byte
@@ -234,18 +332,15 @@ func tryLoadSRS(data []byte, l *netlist.List) (bool, int, string) {
 	count := 0
 	var last string
 	for i := uint64(0); i < length; i++ {
-		// readRule now returns (ct, lastRule)
-		ct, lr := readRule(br, l)
+		c, lr := readRule(br, l)
 		if lr != "" {
 			last = lr
 		}
-		count += ct
+		count += c
 	}
 	return true, count, last
 }
 
-// readRule reads one rule; recurses into logical blocks if needed.
-// returns count and last prefix string
 func readRule(r *bufio.Reader, l *netlist.List) (int, string) {
 	ct := 0
 	var last string
@@ -254,15 +349,15 @@ func readRule(r *bufio.Reader, l *netlist.List) (int, string) {
 		return 0, ""
 	}
 	switch mode {
-	case 0: // default rule
+	case 0:
 		c, lr := readDefault(r, l)
 		ct += c
 		if lr != "" {
 			last = lr
 		}
-	case 1: // logical rule
-		_, _ = r.ReadByte()           // skip logical operator
-		n, _ := binary.ReadUvarint(r) // number of sub-rules
+	case 1:
+		_, _ = r.ReadByte()
+		n, _ := binary.ReadUvarint(r)
 		for j := uint64(0); j < n; j++ {
 			c, lr := readRule(r, l)
 			ct += c
@@ -270,13 +365,11 @@ func readRule(r *bufio.Reader, l *netlist.List) (int, string) {
 				last = lr
 			}
 		}
-		_, _ = r.ReadByte() // skip invert flag
+		_, _ = r.ReadByte()
 	}
 	return ct, last
 }
 
-// readDefault processes IPCIDR items until final marker.
-// returns count and last prefix string
 func readDefault(r *bufio.Reader, l *netlist.List) (int, string) {
 	count := 0
 	var last string
@@ -305,7 +398,6 @@ func readDefault(r *bufio.Reader, l *netlist.List) (int, string) {
 	return count, last
 }
 
-// parseIPSet reads a varbin-encoded list of IP ranges and builds an IPSet value.
 func parseIPSet(r varbin.Reader) (netipx.IPSet, error) {
 	ver, err := r.ReadByte()
 	if err != nil {
@@ -341,4 +433,18 @@ func parseIPSet(r varbin.Reader) (netipx.IPSet, error) {
 		return netipx.IPSet{}, err
 	}
 	return *pPtr, nil
+}
+
+func normalizePrefix(p netip.Prefix) netip.Prefix {
+	addr := p.Addr()
+	if addr.Is4In6() {
+		unmapped := addr.Unmap()
+		bits := p.Bits() - 96
+		if bits < 0 {
+			bits = 0
+		}
+		pfx, _ := unmapped.Prefix(bits)
+		return pfx
+	}
+	return p
 }

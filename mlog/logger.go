@@ -40,18 +40,27 @@ type LogConfig struct {
 
 var (
 	stderr = zapcore.Lock(os.Stderr)
-	lvl    = zap.NewAtomicLevelAt(zap.InfoLevel)
-	l      = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), stderr, lvl))
-	s      = l.Sugar()
+	// MODIFIED: Export Lvl to be accessible from other packages.
+	// This is now the single point of control for the log level.
+	Lvl = zap.NewAtomicLevelAt(zap.InfoLevel)
 
+	// This global logger `l` and `s` will now also be controlled by `Lvl`.
+	l   = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), stderr, Lvl))
+	s   = l.Sugar()
 	nop = zap.NewNop()
 )
 
 func NewLogger(lc LogConfig) (*zap.Logger, error) {
-	lvl, err := zapcore.ParseLevel(lc.Level)
+	// MODIFIED: Use the global atomic level Lvl instead of parsing from config here.
+	// The initial level is set from the config just once.
+	initialLevel, err := zapcore.ParseLevel(lc.Level)
 	if err != nil {
-		return nil, fmt.Errorf("invalid log level: %w", err)
+		// Fallback to InfoLevel if parsing fails but don't return an error,
+		// so the program can start with a default log level.
+		initialLevel = zap.InfoLevel
+		S().Warnf("invalid log level '%s' in config, falling back to 'info'", lc.Level)
 	}
+	Lvl.SetLevel(initialLevel) // Set initial level for the global controller.
 
 	var out zapcore.WriteSyncer
 	if lf := lc.File; len(lf) > 0 {
@@ -64,10 +73,11 @@ func NewLogger(lc LogConfig) (*zap.Logger, error) {
 		out = stderr
 	}
 
+	// All created loggers will now respect the global `Lvl`.
 	if lc.Production {
-		return zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), out, lvl)), nil
+		return zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), out, Lvl)), nil
 	}
-	return zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), out, lvl)), nil
+	return zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), out, Lvl)), nil
 }
 
 // L is a global logger.
@@ -76,8 +86,9 @@ func L() *zap.Logger {
 }
 
 // SetLevel sets the log level for the global logger.
+// DEPRECATED in favor of directly using Lvl.SetLevel().
 func SetLevel(l zapcore.Level) {
-	lvl.SetLevel(l)
+	Lvl.SetLevel(l)
 }
 
 // S is a global logger.
