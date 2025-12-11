@@ -37,7 +37,7 @@ jobs:
             echo "✅ 无新更新（正常状态）"
           fi
           
-          # 5. 保存用于邮件的完整比较链接
+          # 5. 保存用于通知的完整比较链接
           BASE_COMMIT=$(git rev-parse HEAD)
           UPSTREAM_COMMIT=$(git rev-parse upstream/main)
           echo "compare_url=https://github.com/yyysuo/mosdns/compare/${BASE_COMMIT}...${UPSTREAM_COMMIT}?expand=1" >> $GITHUB_ENV
@@ -46,34 +46,24 @@ jobs:
           rm -f diff.log
           git remote remove upstream 2>/dev/null || true
 
-      - name: Send email notification (only if updates found)
+      - name: Send Telegram notification (only if updates found)
         if: env.has_update == 'true'
-        uses: dawidd6/action-send-mail@v3
+        uses: appleboy/telegram-action@master
         with:
-          # 邮箱服务器配置 (使用 Secrets 存储敏感信息)
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USER }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          
-          # 邮件内容
-          subject: "📦 ${GITHUB_REPOSITORY} 检测到 ${env.update_count} 条上游更新！"
-          to: ${{ secrets.NOTIFY_EMAIL }}
-          from: GitHub Actions <${{ secrets.SMTP_USER }}>
-          
-          # HTML 格式邮件（更美观）
-          html_body: |
-            <h2>📦 仓库更新通知</h2>
-            <p>检测到仓库 <strong>${{ github.repository }}</strong> 有 <strong>${{ env.update_count }} 条</strong> 上游更新！</p>
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            📦 *${{ github.repository }} 有更新！*
+            ✅ 检测到 _${{ env.update_count }}_ 条新提交
             
-            <h3>📝 最新提交记录</h3>
-            <pre style="background:#f5f5f5;padding:10px;border-radius:5px">${{ env.latest_commits }}</pre>
+            📝 *最新提交记录：*
+            ```
+            ${{ env.latest_commits }}
+            ```
             
-            <h3>🔗 操作建议</h3>
-            <ul>
-              <li>看查看差异: <a href="${{ env.compare_url }}">GitHub 比较页面</a></li>
-              <li>手动同步: <code>git pull upstream main</code></li>
-            </ul>
+            🔗 [查看完整差异](${{ env.compare_url }})
+            ⏱️ 自动检测时间: $(date +"%Y-%m-%d %H:%M:%S UTC")
             
-            <hr>
-            <small>此通知由 GitHub Actions 自动发送 · <a href="https://github.com/${{ github.repository }}/actions">查看工作流日志</a></small>
+            ℹ️ 通过 GitHub Actions 自动通知
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
