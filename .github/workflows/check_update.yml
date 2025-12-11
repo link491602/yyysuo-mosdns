@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # 仅获取最新提交，加速执行
 
       - name: 检查上游更新
         id: check_updates
@@ -27,7 +29,9 @@ jobs:
           # 4. 检查更新
           if [ -s diff.log ]; then
             echo "has_update=true" >> $GITHUB_ENV
-            echo "update_count=$(wc -l < diff.log | tr -d ' ')" >> $GITHUB_ENV
+            # ✅ 修复：直接获取行数，避免格式问题
+            update_count=$(wc -l < diff.log)
+            echo "update_count=$update_count" >> $GITHUB_ENV
             echo "latest_commits<<EOF" >> $GITHUB_ENV
             cat diff.log | head -n 5 >> $GITHUB_ENV
             echo "EOF" >> $GITHUB_ENV
@@ -49,7 +53,7 @@ jobs:
           git remote remove upstream 2>/dev/null || true
 
       - name: 发送 Telegram 通知（仅当有更新时）
-        if: env.has_update == 'true'
+        if: env.has_update == 'true'  # ✅ 严格字符串匹配
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
