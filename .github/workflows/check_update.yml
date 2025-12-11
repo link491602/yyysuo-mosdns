@@ -1,9 +1,9 @@
-name: 检查ph-mosdns上游更新
+name: 检查上游更新
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # 每天 UTC 时间 2:00 AM 检查
-  workflow_dispatch:     # 允许手动触发
+    - cron: '0 2,14 * * *'  # 每天 UTC 2:00 和 14:00（北京时间 10:00 和 22:00）
+  workflow_dispatch:         # 允许手动触发
 
 jobs:
   check:
