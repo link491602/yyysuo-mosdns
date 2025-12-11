@@ -42,7 +42,11 @@ jobs:
           UPSTREAM_COMMIT=$(git rev-parse --short upstream/main)
           echo "compare_url=https://github.com/yyysuo/mosdns/compare/${BASE_COMMIT}...${UPSTREAM_COMMIT}?expand=1" >> $GITHUB_ENV
           
-          # 6. 清理
+          # 6. 设置中文时间格式
+          DETECT_TIME=$(date +"%Y-%m-%d %H:%M:%S UTC")
+          echo "detect_time=$DETECT_TIME" >> $GITHUB_ENV
+          
+          # 7. 清理
           rm -f diff.log
           git remote remove upstream 2>/dev/null || true
 
@@ -66,7 +70,7 @@ jobs:
             ```
             
             🔗 [🔍 查看完整差异](${{ env.compare_url }})
-            ⏰ **检测时间**：`$(date +"%Y-%m-%d %H:%M:%S UTC")`
+            ⏰ **检测时间**：${{ env.detect_time }}
             
             ────────────────
             ℹ️ 本通知由 GitHub Actions 自动发送
