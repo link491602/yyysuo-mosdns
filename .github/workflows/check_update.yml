@@ -1,4 +1,4 @@
-name: Check Upstream Update
+name: 检查上游更新
 
 on:
   schedule:
@@ -9,61 +9,67 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Check for upstream updates
+      - name: 检查上游更新
         id: check_updates
         run: |
-          # 1. 添加正确的上游仓库
-          git remote add upstream https://github.com/yyysuo/mosdns.git 2>/dev/null || echo "Remote already exists"
+          # 1. 添加上游仓库（带错误处理）
+          git remote add upstream https://github.com/yyysuo/mosdns.git 2>/dev/null || echo "上游仓库已存在"
           
-          # 2. 获取上游更新
-          git fetch upstream --depth=1
+          # 2. 获取更新（限制深度）
+          git fetch upstream --depth=1 || exit 0
           
           # 3. 比较差异
           git log HEAD..upstream/main --oneline > diff.log || true
           
-          # 4. 检查是否有更新
+          # 4. 检查更新
           if [ -s diff.log ]; then
             echo "has_update=true" >> $GITHUB_ENV
-            echo "update_count=$(wc -l < diff.log)" >> $GITHUB_ENV
+            echo "update_count=$(wc -l < diff.log | tr -d ' ')" >> $GITHUB_ENV
             echo "latest_commits<<EOF" >> $GITHUB_ENV
             cat diff.log | head -n 5 >> $GITHUB_ENV
             echo "EOF" >> $GITHUB_ENV
-            echo "✅ 发现 ${update_count} 条上游更新！"
+            echo "✅ 检测到 ${update_count} 条上游更新！"
           else
             echo "has_update=false" >> $GITHUB_ENV
-            echo "✅ 无新更新（正常状态）"
+            echo "✅ 无新更新（状态正常）"
           fi
           
-          # 5. 保存用于通知的完整比较链接
-          BASE_COMMIT=$(git rev-parse HEAD)
-          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+          # 5. 生成比较链接
+          BASE_COMMIT=$(git rev-parse --short HEAD)
+          UPSTREAM_COMMIT=$(git rev-parse --short upstream/main)
           echo "compare_url=https://github.com/yyysuo/mosdns/compare/${BASE_COMMIT}...${UPSTREAM_COMMIT}?expand=1" >> $GITHUB_ENV
           
           # 6. 清理
           rm -f diff.log
           git remote remove upstream 2>/dev/null || true
 
-      - name: Send Telegram notification (only if updates found)
+      - name: 发送 Telegram 通知（仅当有更新时）
         if: env.has_update == 'true'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: markdown
           message: |
-            📦 *${{ github.repository }} 有更新！*
-            ✅ 检测到 _${{ env.update_count }}_ 条新提交
+            🚨 *【仓库更新提醒】*
+            ────────────────
             
-            📝 *最新提交记录：*
+            📦 **仓库**： `${{ github.repository }}`
+            💡 **状态**：发现 `${{ env.update_count }}` 条新提交
+            
+            📝 **最新提交**：
             ```
             ${{ env.latest_commits }}
             ```
             
-            🔗 [查看完整差异](${{ env.compare_url }})
-            ⏱️ 自动检测时间: $(date +"%Y-%m-%d %H:%M:%S UTC")
+            🔗 [🔍 查看完整差异](${{ env.compare_url }})
+            ⏰ **检测时间**：`$(date +"%Y-%m-%d %H:%M:%S UTC")`
             
-            ℹ️ 通过 GitHub Actions 自动通知
+            ────────────────
+            ℹ️ 本通知由 GitHub Actions 自动发送
+            📌 无需回复，有问题请检查 Actions 日志
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
