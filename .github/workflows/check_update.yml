@@ -9,73 +9,94 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - name: 设置缓存目录
+        run: mkdir -p $HOME/upstream-cache
+
+      - name: 恢复上游状态缓存
+        id: cache
+        uses: actions/cache@v3
         with:
-          fetch-depth: 1  # 仅获取最新提交，加速执行
+          path: $HOME/upstream-cache
+          key: upstream-status-${{ github.repository }}
 
       - name: 检查上游更新
         id: check_updates
         run: |
-          # 1. 添加上游仓库（带错误处理）
-          git remote add upstream https://github.com/yyysuo/mosdns.git 2>/dev/null || echo "上游仓库已存在"
+          # 1. 获取上游仓库最新提交
+          UPSTREAM_REPO="https://github.com/yyysuo/mosdns.git"
           
-          # 2. 获取更新（限制深度）
-          git fetch upstream --depth=1 || exit 0
+          # 2. 临时克隆上游仓库（只获取最新提交）
+          git clone --depth=1 $UPSTREAM_REPO temp-upstream || exit 1
+          cd temp-upstream
           
-          # 3. 比较差异
-          git log HEAD..upstream/main --oneline > diff.log || true
+          # 3. 获取当前最新提交哈希
+          CURRENT_HEAD=$(git rev-parse HEAD)
+          echo "current_head=$CURRENT_HEAD" >> $GITHUB_ENV
           
-          # 4. 检查更新
-          if [ -s diff.log ]; then
-            echo "has_update=true" >> $GITHUB_ENV
-            # ✅ 修复：直接获取行数，避免格式问题
-            update_count=$(wc -l < diff.log)
-            echo "update_count=$update_count" >> $GITHUB_ENV
-            echo "latest_commits<<EOF" >> $GITHUB_ENV
-            cat diff.log | head -n 5 >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            echo "✅ 检测到 ${update_count} 条上游更新！"
-          else
-            echo "has_update=false" >> $GITHUB_ENV
-            echo "✅ 无新更新（状态正常）"
+          # 4. 读取上次记录的提交哈希
+          LAST_HEAD_FILE="$HOME/upstream-cache/last_head"
+          LAST_HEAD=""
+          if [ -f "$LAST_HEAD_FILE" ]; then
+            LAST_HEAD=$(cat "$LAST_HEAD_FILE")
+            echo "last_head=$LAST_HEAD" >> $GITHUB_ENV
           fi
           
-          # 5. 设置上游仓库链接
+          # 5. 比较是否有新提交
+          if [ "$CURRENT_HEAD" != "$LAST_HEAD" ]; then
+            echo "has_update=true" >> $GITHUB_ENV
+            
+            # 6. 获取最新提交信息
+            LATEST_COMMIT=$(git log -1 --oneline)
+            echo "latest_commit=$LATEST_COMMIT" >> $GITHUB_ENV
+            echo "update_count=1" >> $GITHUB_ENV
+            
+            # 7. 更新缓存
+            echo "$CURRENT_HEAD" > "$LAST_HEAD_FILE"
+            echo "✅ 检测到上游有新提交！"
+          else
+            echo "has_update=false" >> $GITHUB_ENV
+            echo "✅ 上游无新更新（状态正常）"
+          fi
+          
+          # 8. 获取提交时间（用于通知）
+          COMMIT_TIME=$(git log -1 --format="%cd" --date="format:%Y-%m-%d %H:%M:%S")
+          echo "commit_time=$COMMIT_TIME" >> $GITHUB_ENV
+          
+          # 9. 设置上游仓库链接
           echo "upstream_url=https://github.com/yyysuo/mosdns" >> $GITHUB_ENV
           
-          # 6. 设置中文时间格式
+          # 10. 设置检测时间
           DETECT_TIME=$(date +"%Y-%m-%d %H:%M:%S UTC")
           echo "detect_time=$DETECT_TIME" >> $GITHUB_ENV
           
-          # 7. 清理
-          rm -f diff.log
-          git remote remove upstream 2>/dev/null || true
+          # 11. 清理
+          cd ..
+          rm -rf temp-upstream
 
       - name: 发送 Telegram 通知（仅当有更新时）
-        if: env.has_update == 'true'  # ✅ 严格字符串匹配
+        if: env.has_update == 'true'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
           format: markdown
           message: |
-            🚨 *【仓库更新提醒】*
+            🚨 *【上游仓库更新提醒】*
             ────────────────
             
-            📦 **仓库**： `${{ github.repository }}`
-            💡 **状态**：发现 `${{ env.update_count }}` 条新提交
+            📦 **上游仓库**： [yyysuo/mosdns](${{ env.upstream_url }})
+            💡 **状态**：发现新提交
             
             📝 **最新提交**：
             ```
-            ${{ env.latest_commits }}
+            ${{ env.latest_commit }}
             ```
             
-            🔗 [🔍 查看上游仓库](${{ env.upstream_url }})
-            ⏰ **检测时间**：${{ env.detect_time }}
+            ⏰ **提交时间**：${{ env.commit_time }}
+            🔍 **检测时间**：${{ env.detect_time }}
             
             ────────────────
             ℹ️ 本通知由 GitHub Actions 自动发送
-            📌 无需回复，有问题请检查 Actions 日志
+            📌 无需回复，此通知仅反映上游仓库状态
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
