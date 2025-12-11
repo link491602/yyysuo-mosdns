@@ -1,4 +1,4 @@
-name: 检查上游更新
+name: 检查ph-mosdns上游更新
 
 on:
   schedule:
@@ -37,10 +37,8 @@ jobs:
             echo "✅ 无新更新（状态正常）"
           fi
           
-          # 5. 生成比较链接
-          BASE_COMMIT=$(git rev-parse --short HEAD)
-          UPSTREAM_COMMIT=$(git rev-parse --short upstream/main)
-          echo "compare_url=https://github.com/yyysuo/mosdns/compare/${BASE_COMMIT}...${UPSTREAM_COMMIT}?expand=1" >> $GITHUB_ENV
+          # 5. 设置上游仓库链接
+          echo "upstream_url=https://github.com/yyysuo/mosdns" >> $GITHUB_ENV
           
           # 6. 设置中文时间格式
           DETECT_TIME=$(date +"%Y-%m-%d %H:%M:%S UTC")
@@ -69,7 +67,7 @@ jobs:
             ${{ env.latest_commits }}
             ```
             
-            🔗 [🔍 查看完整差异](${{ env.compare_url }})
+            🔗 [🔍 查看上游仓库](${{ env.upstream_url }})
             ⏰ **检测时间**：${{ env.detect_time }}
             
             ────────────────
