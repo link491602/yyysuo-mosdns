@@ -50,11 +50,21 @@ const (
 	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
 )
 
+// --- START: MODIFICATION 1 of 2 ---
+// Added constants required by the new keyToString function.
+const (
+	adBit = 1 << iota
+	cdBit
+	doBit
+)
+// --- END: MODIFICATION 1 of 2 ---
+
 var _ sequence.RecursiveExecutable = (*Cache)(nil)
 
 type Args struct {
 	Size         int      `yaml:"size"`
 	LazyCacheTTL int      `yaml:"lazy_cache_ttl"`
+	EnableECS    bool     `yaml:"enable_ecs"`
 	ExcludeIPs   []string `yaml:"exclude_ip"`
 	DumpFile     string   `yaml:"dump_file"`
 	DumpInterval int      `yaml:"dump_interval"`
@@ -63,6 +73,7 @@ type Args struct {
 type argsRaw struct {
 	Size         int         `yaml:"size"`
 	LazyCacheTTL int         `yaml:"lazy_cache_ttl"`
+	EnableECS    bool        `yaml:"enable_ecs"`
 	ExcludeIP    interface{} `yaml:"exclude_ip"`
 	DumpFile     string      `yaml:"dump_file"`
 	DumpInterval int         `yaml:"dump_interval"`
@@ -78,6 +89,7 @@ func (a *Args) UnmarshalYAML(node *yaml.Node) error {
 	a.LazyCacheTTL = raw.LazyCacheTTL
 	a.DumpFile = raw.DumpFile
 	a.DumpInterval = raw.DumpInterval
+	a.EnableECS = raw.EnableECS
 
 	switch v := raw.ExcludeIP.(type) {
 	case string:
@@ -104,13 +116,13 @@ func (a *Args) init() {
 }
 
 type Cache struct {
-	args        *Args
-	logger      *zap.Logger
-	backend     *cache.Cache[key, *item]
+	args         *Args
+	logger       *zap.Logger
+	backend      *cache.Cache[key, *item]
 	lazyUpdateSF singleflight.Group
-	closeOnce   sync.Once
-	closeNotify chan struct{}
-	updatedKey  atomic.Uint64
+	closeOnce    sync.Once
+	closeNotify  chan struct{}
+	updatedKey   atomic.Uint64
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -249,12 +261,12 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
-	msgKey := getMsgKey(q)
+	msgKey := getMsgKey(q, qCtx, c.args.EnableECS)
 	if len(msgKey) == 0 {
 		return next.ExecNext(ctx, qCtx)
 	}
 
-	cachedResp, lazyHit := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
+	cachedResp, lazyHit, domainSet := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
 	if lazyHit {
 		c.lazyHitTotal.Inc()
 		c.doLazyUpdate(msgKey, qCtx, next)
@@ -263,6 +275,9 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id
 		qCtx.SetResponse(cachedResp)
+		if domainSet != "" {
+			qCtx.StoreValue(query_context.KeyDomainSet, domainSet)
+		}
 		return nil
 	}
 
@@ -270,7 +285,7 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	r := qCtx.R()
 
 	if r != nil && !c.containsExcluded(r) {
-		saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
+		saveRespToCache(msgKey, qCtx, c.backend, c.args.LazyCacheTTL)
 		c.updatedKey.Add(1)
 	}
 
@@ -294,7 +309,7 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 
 		r := qCtx.R()
 		if r != nil && !c.containsExcluded(r) {
-			saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
+			saveRespToCache(msgKey, qCtx, c.backend, c.args.LazyCacheTTL)
 			c.updatedKey.Add(1)
 		}
 		c.logger.Debug("lazy cache updated", qCtx.InfoField())
@@ -431,6 +446,9 @@ func (c *Cache) Api() *chi.Mux {
 
 			fmt.Fprintf(w, "----- Cache Entry -----\n")
 			fmt.Fprintf(w, "Key:           %s\n", keyToString(k))
+			if v.domainSet != "" {
+				fmt.Fprintf(w, "DomainSet:     %s\n", v.domainSet)
+			}
 			fmt.Fprintf(w, "StoredTime:    %s\n", v.storedTime.Format(time.RFC3339))
 			fmt.Fprintf(w, "MsgExpire:     %s\n", v.expirationTime.Format(time.RFC3339))
 			fmt.Fprintf(w, "CacheExpire:   %s\n", cacheExpirationTime.Format(time.RFC3339))
@@ -445,23 +463,76 @@ func (c *Cache) Api() *chi.Mux {
 	return r
 }
 
-// keyToString 把底层 []byte key 转成人类可读的 "name TYPE CLASS"
+// --- START: MODIFICATION 2 of 2 ---
+// Replaced the old keyToString function with the new, correct version.
+// keyToString 把底层 []byte key 转成人类可读的 "domain TYPE CLASS [flags] [ecs]"
 func keyToString(k key) string {
 	data := []byte(k)
-	// 先解析域名
-	name, offset, err := dns.UnpackDomainName(data, 0)
-	if err != nil {
-		// 解析失败就退回到 hex
-		return fmt.Sprintf("%x", data)
+	offset := 0
+	var parts []string
+
+	// 1. 解析标志位 (1 byte)
+	if len(data) < offset+1 {
+		return fmt.Sprintf("invalid_key(len<1): %x", data)
 	}
-	// 剩下至少 4 字节：TYPE(2) + CLASS(2)
-	if len(data) < offset+4 {
-		return name
+	flagsByte := data[offset]
+	offset++
+	var flags []string
+	if flagsByte&adBit != 0 {
+		flags = append(flags, "AD")
 	}
-	typ := binary.BigEndian.Uint16(data[offset : offset+2])
-	class := binary.BigEndian.Uint16(data[offset+2 : offset+4])
-	return fmt.Sprintf("%s %s %s", name, dns.TypeToString[typ], dns.ClassToString[class])
+	if flagsByte&cdBit != 0 {
+		flags = append(flags, "CD")
+	}
+	if flagsByte&doBit != 0 {
+		flags = append(flags, "DO")
+	}
+
+	// 2. 解析查询类型 (2 bytes)
+	if len(data) < offset+2 {
+		return fmt.Sprintf("invalid_key(len<3): %x", data)
+	}
+	qtype := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	
+	// 3. 解析域名
+	if len(data) < offset+1 {
+		return fmt.Sprintf("invalid_key(len<4): %x", data)
+	}
+	nameLen := int(data[offset])
+	offset++
+	if len(data) < offset+nameLen {
+		return fmt.Sprintf("invalid_key(incomplete_name): %x", data)
+	}
+	qname := string(data[offset : offset+nameLen])
+	parts = append(parts, qname, dns.TypeToString[qtype], "IN") // 假设 Class 总是 IN
+	offset += nameLen
+
+	// 4. 添加解析出的标志位到结果中
+	if len(flags) > 0 {
+		parts = append(parts, fmt.Sprintf("[flags:%s]", strings.Join(flags, ",")))
+	}
+
+	// 5. 解析 ECS (可选)
+	if offset < len(data) { // 如果键中还有剩余数据，那必定是 ECS
+		if len(data) < offset+1 {
+			parts = append(parts, "[ecs:invalid_len_byte]")
+		} else {
+			ecsLen := int(data[offset])
+			offset++
+			if len(data) < offset+ecsLen {
+				parts = append(parts, "[ecs:incomplete_string]")
+			} else {
+				ecs := string(data[offset : offset+ecsLen])
+				parts = append(parts, fmt.Sprintf("[ecs:%s]", ecs))
+			}
+		}
+	}
+
+	// 6. 组装最终结果
+	return strings.Join(parts, " ")
 }
+// --- END: MODIFICATION 2 of 2 ---
 
 // dnsMsgToString 将 *dns.Msg 转为可读文本
 func dnsMsgToString(msg *dns.Msg) string {
@@ -511,6 +582,7 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 			MsgExpirationTime:   v.expirationTime.Unix(),
 			MsgStoredTime:       v.storedTime.Unix(),
 			Msg:                 msg,
+			DomainSet:           v.domainSet,
 		}
 		block.Entries = append(block.Entries, e)
 		if len(block.Entries) >= dumpBlockSize {
@@ -578,6 +650,7 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 				resp:           resp,
 				storedTime:     storedTime,
 				expirationTime: msgExpTime,
+				domainSet:      entry.GetDomainSet(),
 			}
 			c.backend.Store(key(entry.GetKey()), i, cacheExpTime)
 		}

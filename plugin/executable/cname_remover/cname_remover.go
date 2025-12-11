@@ -15,7 +15,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
- 
+
 package cname_remover
 
 import (
@@ -62,6 +62,34 @@ func (c *cnameRemover) Exec(ctx context.Context, qCtx *query_context.Context) er
 	}
 	// =============================================================
 
+	// ==================== 新增：DNAME 记录检查 =====================
+	// 在进行任何修改之前，先遍历一遍响应，检查是否存在 DNAME 记录。
+	// DNAME 是一条重要的重写规则，不能被简单移除或忽略。
+	// 如果发现 DNAME 记录，则立即中止本插件的任何操作，
+	// 将原始响应原封不动地传递给下一个插件，以确保解析逻辑的正确性。
+	for _, rr := range r.Answer {
+		if rr.Header().Rrtype == dns.TypeDNAME {
+			return nil // 发现 DNAME，立即退出，不做任何修改。
+		}
+	}
+	// =============================================================
+	// 目的：防止上游DNS只返回了CNAME但没有返回IP（不完整响应）时，
+	// 本插件误将唯一的CNAME删除导致返回空包。
+	hasIP := false
+	for _, rr := range r.Answer {
+		// 只要发现 A 或 AAAA 记录，说明包含 IP
+		if rr.Header().Rrtype == dns.TypeA || rr.Header().Rrtype == dns.TypeAAAA {
+			hasIP = true
+			break
+		}
+	}
+
+	// 如果遍历完发现没有 IP 记录，说明这是一个纯 CNAME 链（或者其他非IP响应）。
+	// 此时不能执行删除操作，必须保留 CNAME 供客户端进行递归解析。
+	if !hasIP {
+		return nil
+	}
+	
 	qName := qCtx.QQuestion().Name
 
 	// ==================== 变更点 2: 高效的切片操作 ====================

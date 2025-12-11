@@ -3,14 +3,19 @@ package coremain
 import (
 	"container/heap"
 	"container/list"
+	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/miekg/dns"
+	"go.uber.org/zap"
 )
 
 // --- REWRITTEN: String interning with a fixed-size, concurrent-safe LRU cache ---
@@ -84,7 +89,7 @@ func internString(s string) string {
 
 // --- ADDED: A wrapper struct to pass duration along with the context ---
 type auditContext struct {
-	Ctx               *query_context.Context
+	Ctx                *query_context.Context
 	ProcessingDuration time.Duration
 }
 
@@ -107,6 +112,7 @@ type AuditLog struct {
 	ResponseCode  string         `json:"response_code"`
 	ResponseFlags ResponseFlags  `json:"response_flags"`
 	Answers       []AnswerDetail `json:"answers"`
+	DomainSet     string         `json:"domain_set,omitempty"`
 }
 
 // ADDED: A struct to group response flags for clarity in JSON.
@@ -121,7 +127,13 @@ const (
 	maxAuditCapacity       = 400000
 	slowestQueriesCapacity = 300
 	auditChannelCapacity   = 1024
+	auditSettingsFilename  = "audit_settings.json" // <<< ADDED
 )
+
+// <<< ADDED: Struct for persistent settings
+type AuditSettings struct {
+	Capacity int `json:"capacity"`
+}
 
 // --- MODIFIED: The heap now stores values (AuditLog) instead of pointers (*AuditLog) ---
 type slowestQueryHeap []AuditLog
@@ -151,14 +163,48 @@ type AuditCollector struct {
 	slowestQueries     slowestQueryHeap
 	domainCounts       map[string]int
 	clientCounts       map[string]int
+	domainSetCounts    map[string]int
 	totalQueryCount    uint64
 	totalQueryDuration float64
-	// --- MODIFIED: The channel now holds our wrapper struct ---
-	ctxChan    chan *auditContext
-	workerDone chan struct{}
+	ctxChan            chan *auditContext
+	workerDone         chan struct{}
 }
 
+// <<< MODIFIED: Global variable is initialized with the default value first.
 var GlobalAuditCollector = NewAuditCollector(defaultAuditCapacity)
+
+// <<< NEW: An exported function to re-initialize the collector with a loaded capacity.
+func InitializeAuditCollector(configBaseDir string) {
+	initialCapacity := defaultAuditCapacity
+	settingsPath := filepath.Join(configBaseDir, auditSettingsFilename)
+	settings := &AuditSettings{}
+	data, err := os.ReadFile(settingsPath)
+
+	if err == nil {
+		if json.Unmarshal(data, settings) == nil {
+			initialCapacity = settings.Capacity
+			// Apply validation
+			if initialCapacity < 0 {
+				initialCapacity = 0
+			}
+			if initialCapacity > maxAuditCapacity {
+				initialCapacity = maxAuditCapacity
+			}
+			mlog.S().Infof("Loaded audit log capacity from settings file: %s, capacity: %d", settingsPath, initialCapacity)
+		} else {
+			mlog.S().Warnf("Failed to parse audit settings file '%s', using default. Error: %v", settingsPath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		// Log error only if it's not a "file not found" error
+		mlog.S().Warnf("Failed to read audit settings file '%s', using default. Error: %v", settingsPath, err)
+	}
+
+	// Re-initialize the global collector if the capacity from file is different from the initial default.
+	// This is safe because it happens at the very beginning of the startup, before any logs are collected.
+	if initialCapacity != defaultAuditCapacity {
+		GlobalAuditCollector = NewAuditCollector(initialCapacity)
+	}
+}
 
 func NewAuditCollector(capacity int) *AuditCollector {
 	c := &AuditCollector{
@@ -168,11 +214,11 @@ func NewAuditCollector(capacity int) *AuditCollector {
 		slowestQueries:     make(slowestQueryHeap, 0, slowestQueriesCapacity),
 		domainCounts:       make(map[string]int),
 		clientCounts:       make(map[string]int),
+		domainSetCounts:    make(map[string]int),
 		totalQueryCount:    0,
 		totalQueryDuration: 0.0,
-		// --- MODIFIED: Initialize the channel with the new type ---
-		ctxChan:    make(chan *auditContext, auditChannelCapacity),
-		workerDone: make(chan struct{}),
+		ctxChan:            make(chan *auditContext, auditChannelCapacity),
+		workerDone:         make(chan struct{}),
 	}
 	heap.Init(&c.slowestQueries)
 	return c
@@ -189,7 +235,6 @@ func (c *AuditCollector) StopWorker() {
 
 func (c *AuditCollector) worker() {
 	defer close(c.workerDone)
-	// --- MODIFIED: The worker now receives the wrapper struct ---
 	for wrappedCtx := range c.ctxChan {
 		if wrappedCtx != nil && wrappedCtx.Ctx != nil {
 			c.processContext(wrappedCtx)
@@ -205,14 +250,27 @@ func (c *AuditCollector) processContext(wrappedCtx *auditContext) {
 	duration := wrappedCtx.ProcessingDuration
 
 	log := AuditLog{
-		ClientIP:      internString(qCtx.ServerMeta.ClientAddr.String()),
-		QueryType:     internString(dns.TypeToString[qQuestion.Qtype]),
-		QueryName:     internString(strings.TrimSuffix(qQuestion.Name, ".")),
-		QueryClass:    internString(dns.ClassToString[qQuestion.Qclass]),
-		QueryTime:     qCtx.StartTime(),
-		DurationMs:    float64(duration.Microseconds()) / 1000.0,
-		TraceID:       qCtx.TraceID,
+		ClientIP:   internString(qCtx.ServerMeta.ClientAddr.String()),
+		QueryType:  internString(dns.TypeToString[qQuestion.Qtype]),
+		QueryName:  internString(strings.TrimSuffix(qQuestion.Name, ".")),
+		QueryClass: internString(dns.ClassToString[qQuestion.Qclass]),
+		QueryTime:  qCtx.StartTime(),
+		DurationMs: float64(duration.Microseconds()) / 1000.0,
+		TraceID:    qCtx.TraceID,
 	}
+
+	if val, ok := qCtx.GetValue(query_context.KeyDomainSet); ok {
+		if name, isString := val.(string); isString {
+			log.DomainSet = name
+		}
+	}
+
+	// --- ADDED START ---
+	// 1.     DomainSet  侄 为  ,         为 "unmatched_rule"
+	if log.DomainSet == "" {
+		log.DomainSet = "unmatched_rule"
+	}
+	// --- ADDED END ---
 
 	if resp := qCtx.R(); resp != nil {
 		log.ResponseCode = internString(dns.RcodeToString[resp.Rcode])
@@ -278,6 +336,15 @@ func (c *AuditCollector) processContext(wrappedCtx *auditContext) {
 		if c.clientCounts[oldLog.ClientIP] <= 0 {
 			delete(c.clientCounts, oldLog.ClientIP)
 		}
+
+		// --- MODIFIED START ---
+		// 2.  瞥  if oldLog.DomainSet != ""         为     DomainSet   远  为  
+		c.domainSetCounts[oldLog.DomainSet]--
+		if c.domainSetCounts[oldLog.DomainSet] <= 0 {
+			delete(c.domainSetCounts, oldLog.DomainSet)
+		}
+		// --- MODIFIED END ---
+
 		c.totalQueryDuration -= oldLog.DurationMs
 		c.totalQueryCount--
 
@@ -295,16 +362,21 @@ func (c *AuditCollector) processContext(wrappedCtx *auditContext) {
 	c.domainCounts[log.QueryName]++
 	c.clientCounts[log.ClientIP]++
 
+	// --- MODIFIED START ---
+	// 3.  瞥  if log.DomainSet != ""         为     DomainSet   远  为  
+	c.domainSetCounts[log.DomainSet]++
+	// --- MODIFIED END ---
+
 	c.totalQueryCount++
 	c.totalQueryDuration += log.DurationMs
 }
 
-// --- MODIFIED: Collect now wraps the context and duration before sending ---
+// --- Collect and other functions remain unchanged ---
 func (c *AuditCollector) Collect(qCtx *query_context.Context) {
 	duration := time.Since(qCtx.StartTime())
 
 	wrappedCtx := &auditContext{
-		Ctx:               qCtx,
+		Ctx:                qCtx,
 		ProcessingDuration: duration,
 	}
 
@@ -316,9 +388,13 @@ func (c *AuditCollector) Collect(qCtx *query_context.Context) {
 	}
 }
 
-func (c *AuditCollector) Start()          { c.mu.Lock(); c.capturing = true; c.mu.Unlock() }
-func (c *AuditCollector) Stop()           { c.mu.Lock(); c.capturing = false; c.mu.Unlock() }
-func (c *AuditCollector) IsCapturing() bool { c.mu.RLock(); defer c.mu.RUnlock(); return c.capturing }
+func (c *AuditCollector) Start() { c.mu.Lock(); c.capturing = true; c.mu.Unlock() }
+func (c *AuditCollector) Stop()  { c.mu.Lock(); c.capturing = false; c.mu.Unlock() }
+func (c *AuditCollector) IsCapturing() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.capturing
+}
 
 func (c *AuditCollector) GetLogs() []AuditLog {
 	c.mu.RLock()
@@ -350,6 +426,7 @@ func (c *AuditCollector) ClearLogs() {
 	heap.Init(&c.slowestQueries)
 	c.domainCounts = make(map[string]int)
 	c.clientCounts = make(map[string]int)
+	c.domainSetCounts = make(map[string]int)
 	c.totalQueryCount = 0
 	c.totalQueryDuration = 0.0
 }
@@ -360,7 +437,8 @@ func (c *AuditCollector) GetCapacity() int {
 	return c.capacity
 }
 
-func (c *AuditCollector) SetCapacity(newCapacity int) {
+// <<< MODIFIED: SetCapacity now takes the config base directory as an argument
+func (c *AuditCollector) SetCapacity(newCapacity int, configBaseDir string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -371,6 +449,9 @@ func (c *AuditCollector) SetCapacity(newCapacity int) {
 		newCapacity = maxAuditCapacity
 	}
 
+	// Save the new capacity to file
+	c.saveSettings(newCapacity, configBaseDir)
+
 	c.capacity = newCapacity
 	c.logs = make([]AuditLog, 0, newCapacity)
 	c.head = 0
@@ -378,8 +459,25 @@ func (c *AuditCollector) SetCapacity(newCapacity int) {
 	heap.Init(&c.slowestQueries)
 	c.domainCounts = make(map[string]int)
 	c.clientCounts = make(map[string]int)
+	c.domainSetCounts = make(map[string]int)
 	c.totalQueryCount = 0
 	c.totalQueryDuration = 0.0
+}
+
+// <<< ADDED: saveSettings helper function
+func (c *AuditCollector) saveSettings(capacityToSave int, configBaseDir string) {
+	settings := AuditSettings{Capacity: capacityToSave}
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		mlog.L().Error("failed to marshal audit settings", zap.Error(err))
+		return
+	}
+	settingsPath := filepath.Join(configBaseDir, auditSettingsFilename)
+	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
+		mlog.L().Error("failed to write audit settings file", zap.String("path", settingsPath), zap.Error(err))
+	} else {
+		mlog.L().Info("successfully saved audit settings", zap.String("path", settingsPath), zap.Int("capacity", capacityToSave))
+	}
 }
 
 type V2GetLogsParams struct {
@@ -453,8 +551,9 @@ func (c *AuditCollector) getRankFromMap(sourceMap map[string]int, limit int) []V
 type RankType string
 
 const (
-	RankByDomain RankType = "domain"
-	RankByClient RankType = "client"
+	RankByDomain    RankType = "domain"
+	RankByClient    RankType = "client"
+	RankByDomainSet RankType = "domain_set"
 )
 
 func (c *AuditCollector) CalculateRank(rankType RankType, limit int) []V2RankItem {
@@ -466,6 +565,8 @@ func (c *AuditCollector) CalculateRank(rankType RankType, limit int) []V2RankIte
 		return c.getRankFromMap(c.domainCounts, limit)
 	case RankByClient:
 		return c.getRankFromMap(c.clientCounts, limit)
+	case RankByDomainSet:
+		return c.getRankFromMap(c.domainSetCounts, limit)
 	default:
 		return []V2RankItem{}
 	}
@@ -492,7 +593,6 @@ func (c *AuditCollector) GetSlowestQueries(limit int) []AuditLog {
 	return snapshot
 }
 
-// --- MODIFIED: Added TraceID to the global search logic. ---
 func (c *AuditCollector) GetV2Logs(params V2GetLogsParams) V2PaginatedLogsResponse {
 	snapshot := c.getLogsSnapshot()
 	filteredLogs := make([]AuditLog, 0, len(snapshot))
@@ -533,6 +633,17 @@ func (c *AuditCollector) GetV2Logs(params V2GetLogsParams) V2PaginatedLogsRespon
 			// Check TraceID
 			if !foundInQ {
 				haystack = log.TraceID
+				if !params.Exact {
+					haystack = strings.ToLower(haystack)
+				}
+				if matchFunc(haystack, searchTerm) {
+					foundInQ = true
+				}
+			}
+			
+			// Check DomainSet
+			if !foundInQ && log.DomainSet != "" {
+				haystack = log.DomainSet
 				if !params.Exact {
 					haystack = strings.ToLower(haystack)
 				}

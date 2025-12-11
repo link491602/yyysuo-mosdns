@@ -25,6 +25,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"golang.org/x/exp/constraints"
@@ -38,9 +39,20 @@ func (k key) Sum() uint64 {
 	return maphash.String(seed, string(k))
 }
 
+func getECSClient(qCtx *query_context.Context) string {
+	queryOpt := qCtx.QOpt()
+	// Check if query already has an ecs.
+	for _, o := range queryOpt.Option {
+		if o.Option() == dns.EDNS0SUBNET {
+			return o.String()
+		}
+	}
+	return ""
+}
+
 // getMsgKey returns a string key for the query msg, or an empty
 // string if query should not be cached.
-func getMsgKey(q *dns.Msg) string {
+func getMsgKey(q *dns.Msg, qCtx *query_context.Context, useECS bool) string {
 	if q.Response || q.Opcode != dns.OpcodeQuery || len(q.Question) != 1 {
 		return ""
 	}
@@ -52,7 +64,15 @@ func getMsgKey(q *dns.Msg) string {
 	)
 
 	question := q.Question[0]
-	buf := make([]byte, 1+2+1+len(question.Name)) // bits + qtype + qname length + qname
+	// bits + qtype + qname length + qname
+	totalLen := 1 + 2 + 1 + len(question.Name)
+	ecs := ""
+	if useECS {
+		ecs = getECSClient(qCtx)
+		// if useECS: bits + qtype + qname length + qname + ecs length + ecs
+		totalLen += 1 + len(ecs)
+	}
+	buf := make([]byte, totalLen)
 	b := byte(0)
 	// RFC 6840 5.7: The AD bit in a query as a signal
 	// indicating that the requester understands and is interested in the
@@ -71,6 +91,10 @@ func getMsgKey(q *dns.Msg) string {
 	buf[2] = byte(question.Qtype)
 	buf[3] = byte(len(question.Name))
 	copy(buf[4:], question.Name)
+	if len(ecs) > 0 {
+		buf[4+len(question.Name)] = byte(len(ecs))
+		copy(buf[4+len(question.Name)+1:], ecs)
+	}
 	return utils.BytesToStringUnsafe(buf)
 }
 
@@ -78,6 +102,7 @@ type item struct {
 	resp           *dns.Msg
 	storedTime     time.Time
 	expirationTime time.Time
+	domainSet      string
 }
 
 func copyNoOpt(m *dns.Msg) *dns.Msg {
@@ -133,7 +158,7 @@ func min[T constraints.Ordered](a, b T) T {
 // The ttl of returned msg will be changed properly.
 // Returned bool indicates whether this response is hit by lazy cache.
 // Note: Caller SHOULD change the msg id because it's not same as query's.
-func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool) {
+func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool, string) {
 	// Lookup cache
 	v, _, _ := backend.Get(key(msgKey))
 
@@ -145,7 +170,7 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		if now.Before(v.expirationTime) {
 			r := v.resp.Copy()
 			dnsutils.SubtractTTL(r, uint32(now.Sub(v.storedTime).Seconds()))
-			return r, false
+			return r, false, v.domainSet
 		}
 
 		// Msg expired but cache isn't. This is a lazy cache enabled entry.
@@ -153,17 +178,18 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		if lazyCacheEnabled {
 			r := v.resp.Copy()
 			dnsutils.SetTTL(r, uint32(lazyTtl))
-			return r, true
+			return r, true, v.domainSet
 		}
 	}
 
 	// cache miss
-	return nil, false
+	return nil, false, ""
 }
 
 // saveRespToCache saves r to cache backend. It returns false if r
 // should not be cached and was skipped.
-func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item], lazyCacheTtl int) bool {
+func saveRespToCache(msgKey string, qCtx *query_context.Context, backend *cache.Cache[key, *item], lazyCacheTtl int) bool {
+	r := qCtx.R()
 	if r.Truncated != false {
 		return false
 	}
@@ -182,7 +208,13 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 		if len(r.Answer) == 0 { // Empty answer. Set ttl between 0~300.
 			const maxEmtpyAnswerTtl = 300
 			msgTtl = time.Duration(min(minTTL, maxEmtpyAnswerTtl)) * time.Second
-			cacheTtl = msgTtl
+			// --- START MODIFICATION 1 of 2: Apply lazy_cache_ttl to empty answers ---
+			if lazyCacheTtl > 0 {
+				cacheTtl = time.Duration(lazyCacheTtl) * time.Second
+			} else {
+				cacheTtl = msgTtl
+			}
+			// --- END MODIFICATION 1 of 2 ---
 		} else {
 			msgTtl = time.Duration(minTTL) * time.Second
 			if lazyCacheTtl > 0 {
@@ -192,9 +224,19 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 			}
 		}
 	}
-	if msgTtl <= 0 || cacheTtl <= 0 {
-		return false
+
+	// --- START MODIFICATION 2 of 2: Safety net for TTL=0 ---
+	// Safety net: Prevents TTL=0 for any reason, ensuring the entry has a minimal lifespan.
+	// This replaces the original `if msgTtl <= 0 ... return false` check.
+	const minCacheableTTL = 5 * time.Second
+	if msgTtl <= 0 {
+		msgTtl = minCacheableTTL
 	}
+	// Also check cacheTtl in case lazy_cache_ttl is not configured.
+	if cacheTtl <= 0 {
+		cacheTtl = minCacheableTTL
+	}
+	// --- END MODIFICATION 2 of 2 ---
 
 	now := time.Now()
 	v := &item{
@@ -202,6 +244,13 @@ func saveRespToCache(msgKey string, r *dns.Msg, backend *cache.Cache[key, *item]
 		storedTime:     now,
 		expirationTime: now.Add(msgTtl),
 	}
+
+	if val, ok := qCtx.GetValue(query_context.KeyDomainSet); ok {
+		if name, isString := val.(string); isString {
+			v.domainSet = name
+		}
+	}
+
 	backend.Store(key(msgKey), v, now.Add(cacheTtl))
 	return true
 }
