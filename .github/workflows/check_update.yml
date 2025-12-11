@@ -2,35 +2,86 @@ name: Check Upstream Update
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
+    - cron: '0 2 * * *'  # 每天 UTC 时间 2:00 AM 触发
+  workflow_dispatch:     # 允许手动触发
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: "https://github.com/yyysuo/mosdns.git"  # 修复1：标准 .git URL
+      UPSTREAM_BRANCH: "main"  # 明确指定上游分支
 
     steps:
-      - name: Checkout your repo
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4  # 升级到最新版 checkout action
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
 
       - name: Add upstream and fetch
         run: |
-          git remote add upstream https://github.com/yyysuo/mosdns?tab=readme-ov-file
-          git fetch upstream
-          git log HEAD..upstream/main --oneline > diff.log
+          echo "🔍 Adding upstream remote: $UPSTREAM_REPO"
+          git remote add upstream "$UPSTREAM_REPO" || echo "Remote already exists"
+          
+          echo "📥 Fetching upstream changes..."
+          git fetch upstream --depth=1  # 减少数据量，加速执行
+          
+          echo "📝 Comparing commits:"
+          git log HEAD..upstream/$UPSTREAM_BRANCH --oneline > diff.log || true
+          
+          echo "📋 Diff content:"
+          cat diff.log || echo "No updates found"
+        env:
+          GIT_TERMINAL_PROMPT: 0  # 禁用交互式提示
 
       - name: Check for updates
+        id: update_check
         run: |
           if [ -s diff.log ]; then
+            echo "✅ Updates detected!"
             echo "has_update=true" >> $GITHUB_ENV
+            echo "UPDATE_COUNT=$(wc -l < diff.log)" >> $GITHUB_ENV
+          else
+            echo "❌ No updates found"
+            echo "has_update=false" >> $GITHUB_ENV
           fi
 
       - name: Notify via Cloudflare Worker
         if: env.has_update == 'true'
         run: |
-          curl -X POST ${{ secrets.WORKER_URL }} \
+          # 安全转义特殊字符（特别是双引号）
+          ESCAPED_LOG=$(cat diff.log | head -n 5 | sed 's/"/\\"/g' | sed 's/\\/\\\\/g')
+          
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "📦 仓库『${{ github.repository }}』检测到 ${UPDATE_COUNT} 条更新！\n📝 最新提交记录：\n$ESCAPED_LOG\n🔗 查看更新: https://github.com/${{ github.repository }}/compare/$(git rev-parse HEAD)...$(git rev-parse upstream/$UPSTREAM_BRANCH)?expand=1"
+          }
+          EOF
+          )
+          
+          echo "📤 Sending notification to Cloudflare Worker..."
+          echo "Payload preview: ${PAYLOAD:0:200}..."  # 仅显示前200字符预览
+          
+          curl -X POST "${{ secrets.WORKER_URL }}" \
             -H "Content-Type: application/json" \
-            -d '{"text": "📦 仓库『${{ github.repository }}』有更新！\n📝 提交记录：\n'"$(cat diff.log | head -n 5)"'"}'
+            -d "$PAYLOAD" \
+            -w "\nHTTP Status: %{http_code}\n" \
+            --fail  # 非2xx状态码时失败
+        env:
+          UPDATE_COUNT: ${{ env.UPDATE_COUNT }}
 
       - name: Clean up
-        run: rm -f diff.log
+        run: |
+          rm -f diff.log
+          git remote remove upstream || true  # 确保清理远程
+
+      - name: Final status report
+        run: |
+          if [ "$has_update" = "true" ]; then
+            echo "✅ SUCCESS: Update notification sent!"
+          else
+            echo "✅ SUCCESS: No updates found (expected behavior)"
+          fi
