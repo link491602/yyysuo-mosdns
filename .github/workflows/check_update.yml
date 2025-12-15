@@ -2,8 +2,12 @@ name: 检查上游更新
 
 on:
   schedule:
-    - cron: '0 2,14 * * *'  # 每天 UTC 2:00 和 14:00（北京时间 10:00 和 22:00）
-  workflow_dispatch:         # 允许手动触发
+    - cron: '0 2,14 * * *'
+  workflow_dispatch:
+
+# 关键：添加写入权限，否则无法 git push
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -12,7 +16,8 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # 需要写入权限
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # 建议获取完整历史，避免一些 git 报错
 
       - name: 检查上游更新
         id: check_updates
@@ -21,77 +26,71 @@ jobs:
           STATE_FILE=".github/last_upstream_commit"
           UPSTREAM_REPO="https://github.com/yyysuo/mosdns.git"
           
-          # 2. 临时克隆上游（只获取最新提交）
+          # 2. 临时克隆上游
           git clone --depth=1 $UPSTREAM_REPO temp-upstream || exit 1
           cd temp-upstream
           
-          # 3. 获取当前最新提交哈希
           CURRENT_HEAD=$(git rev-parse HEAD)
           CURRENT_COMMIT=$(git log -1 --oneline)
+          # 获取作者日期，确保格式兼容
           COMMIT_TIME=$(git log -1 --format="%cd" --date="format:%Y-%m-%d %H:%M:%S")
           cd ..
           
-          # 4. 读取上次记录的提交哈希
+          # 3. 读取旧状态
           LAST_HEAD=""
           if [ -f "$STATE_FILE" ]; then
             LAST_HEAD=$(cat "$STATE_FILE")
-            echo "上次记录的提交: $LAST_HEAD"
-          else
-            echo "首次运行，创建状态文件"
           fi
           
-          # 5. 比较是否有新提交
+          # 4. 比较
           if [ "$CURRENT_HEAD" != "$LAST_HEAD" ]; then
             echo "has_update=true" >> $GITHUB_ENV
-            echo "latest_commit=$CURRENT_COMMIT" >> $GITHUB_ENV
-            echo "commit_time=$COMMIT_TIME" >> $GITHUB_ENV
             
-            # 6. 更新状态文件
+            # 使用 EOF 写入环境变量以支持特殊字符（防御性编程）
+            {
+              echo "latest_commit<<EOF"
+              echo "$CURRENT_COMMIT"
+              echo "EOF"
+            } >> $GITHUB_ENV
+            
+            echo "commit_time=$COMMIT_TIME" >> $GITHUB_ENV
+            echo "upstream_url=https://github.com/yyysuo/mosdns" >> $GITHUB_ENV
+            echo "detect_time=$(date +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_ENV
+            
+            # 5. 更新并推送
             mkdir -p .github
             echo "$CURRENT_HEAD" > "$STATE_FILE"
+            
             git config user.name "github-actions"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add "$STATE_FILE"
-            git commit -m "更新上游状态: $CURRENT_HEAD" || echo "无变更需要提交"
-            git push origin main || echo "推送失败，可能是无变更"
-            
-            echo "✅ 检测到上游新提交，已更新状态文件"
+            git commit -m "chore: update upstream state to $CURRENT_HEAD"
+            git push origin main
           else
             echo "has_update=false" >> $GITHUB_ENV
-            echo "✅ 上游无新更新（状态正常）"
+            echo "✅ 无更新"
           fi
           
-          # 7. 设置其他环境变量
-          echo "upstream_url=https://github.com/yyysuo/mosdns" >> $GITHUB_ENV
-          echo "detect_time=$(date +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_ENV
-          
-          # 8. 清理
           rm -rf temp-upstream
 
-      - name: 发送 Telegram 通知（仅当有更新时）
+      - name: 发送 Telegram 通知
         if: env.has_update == 'true'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
           format: markdown
+          # 注意：YAML 中多行字符串缩进要正确
           message: |
             🚨 *【上游仓库更新提醒】*
             ────────────────
             
-            📦 **上游仓库**： [yyysuo/mosdns](${{ env.upstream_url }})
-            💡 **状态**：发现新提交
+            📦 **仓库**：[yyysuo/mosdns](${{ env.upstream_url }})
             
             📝 **最新提交**：
-            ```
-            ${{ env.latest_commit }}
-            ```
+            `${{ env.latest_commit }}`
             
             ⏰ **提交时间**：${{ env.commit_time }}
-            🔍 **检测时间**：${{ env.detect_time }}
             
             ────────────────
-            ℹ️ 本通知由 GitHub Actions 自动发送
-            📌 无需回复，此通知仅反映上游仓库状态
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+            ℹ️ _By GitHub Actions_
